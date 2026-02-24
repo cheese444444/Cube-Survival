@@ -1,0 +1,529 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Cube Survival — Enhanced</title>
+  <style>
+    :root{
+      --bg:#071025; --panel:#0b1220; --accent:#4ade80; --danger:#fb7185; --muted:rgba(230,238,248,.65)
+    }
+    html,body{height:100%;margin:0;font-family:Inter,system-ui,Segoe UI,Roboto,Arial}
+    body{display:flex;align-items:center;justify-content:center;background:linear-gradient(180deg,#071025 0%, #0b1220 100%);color:#e6eef8}
+    .wrap{width:980px;max-width:96vw;background:var(--panel);border-radius:12px;padding:16px;box-shadow:0 8px 40px rgba(2,6,23,.75)}
+    header{display:flex;align-items:center;gap:12px;margin-bottom:8px}
+    h1{font-size:1.15rem;margin:0}
+    .meta{margin-left:auto;font-size:.9rem;opacity:.95;color:var(--muted)}
+    canvas{display:block;border-radius:10px;background:linear-gradient(180deg,#071225,#06111b);width:100%;height:620px}
+    .hud{display:flex;gap:8px;align-items:center;margin-top:10px}
+    .pill{padding:6px 10px;border-radius:10px;background:rgba(255,255,255,.03);font-size:.92rem}
+    .btn{margin-left:auto;padding:8px 12px;border-radius:10px;border:0;background:#18354b;color:#dff6ff;cursor:pointer}
+    .legend{font-size:.85rem;margin-top:8px;color:rgba(230,238,248,.78)}
+    .small{font-size:.82rem;color:var(--muted)}
+    @media (max-width:520px){canvas{height:460px}}
+    .kbd{background:rgba(255,255,255,.03);padding:4px 8px;border-radius:6px}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <h1>Cube Survival — Enhanced</h1>
+      <div class="meta small">Survive waves • Pickups & combos • Arrow keys / WASD</div>
+    </header>
+
+    <canvas id="c" width="1200" height="800"></canvas>
+
+    <div class="hud">
+      <div class="pill" id="score">Time: 0.0s</div>
+      <div class="pill" id="health">Health: 3</div>
+      <div class="pill" id="power">Power: —</div>
+      <div class="pill small" id="mult">x1</div>
+      <button class="btn" id="restart">Restart</button>
+    </div>
+    <div class="legend">
+      Controls: <span class="kbd">Arrow keys</span> or <span class="kbd">WASD</span> to move. Avoid red enemies. Pick up colored cubes: green heal, blue shield, yellow speed, purple multiplier.
+    </div>
+  </div>
+
+<script>
+(() => {
+  // Canvas & HiDPI
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d');
+
+  function resize(){
+    const ratio = Math.min(window.devicePixelRatio || 1, 2);
+    const w = canvas.clientWidth;
+    const h = Math.min(700, Math.max(420, Math.floor(window.innerHeight * 0.62)));
+    canvas.width = Math.floor(w * ratio);
+    canvas.height = Math.floor(h * ratio);
+    canvas.style.height = h + 'px';
+    ctx.setTransform(ratio,0,0,ratio,0,0);
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  // UI
+  const scoreEl = document.getElementById('score');
+  const healthEl = document.getElementById('health');
+  const powerEl = document.getElementById('power');
+  const multEl = document.getElementById('mult');
+  const restartBtn = document.getElementById('restart');
+
+  // Input
+  const keys = {};
+  window.addEventListener('keydown', e => {
+    keys[e.key.toLowerCase()] = true;
+    if([' ','enter'].includes(e.key.toLowerCase())) e.preventDefault();
+  });
+  window.addEventListener('keyup', e => { keys[e.key.toLowerCase()] = false; });
+
+  // Audio: tiny synth for feedback
+  const AudioCtx = window.AudioContext || window.webkitAudioContext;
+  const audio = AudioCtx ? new AudioCtx() : null;
+  function beep(freq=440, time=0.08, type='sine', vol=0.08){
+    if(!audio) return;
+    const o = audio.createOscillator();
+    const g = audio.createGain();
+    o.type = type; o.frequency.value = freq;
+    g.gain.value = vol;
+    o.connect(g); g.connect(audio.destination);
+    o.start();
+    g.gain.exponentialRampToValueAtTime(0.0001, audio.currentTime + time);
+    o.stop(audio.currentTime + time + 0.02);
+  }
+
+  // Game state factory
+  function newState(){
+    const ratio = (window.devicePixelRatio || 1);
+    return {
+      running:true,
+      time:0,
+      player:{
+        x: (canvas.width/ratio)/4,
+        y: (canvas.height/ratio)/2,
+        size:26, baseSpeed:160, speed:160, color:'#7dd3fc',
+        health:3, invulnerable:0, speedBoost:0, shield:0
+      },
+      enemies: [],
+      powerups: [],
+      particles: [],
+      lastEnemySpawn:0,
+      lastPowerSpawn:0,
+      lastWave:0,
+      enemySpawnInterval:1.4,
+      powerSpawnInterval:5.0,
+      score:0,
+      combo:0,
+      comboTimer:0,
+      multiplier:1,
+      wave:1,
+      nextBurstAt:8 + Math.random()*6
+    };
+  }
+  let state = newState();
+
+  // Utilities
+  const rand = (a,b)=> a + Math.random()*(b-a);
+  function clamp(v,a,b){ return Math.max(a,Math.min(b,v)); }
+
+  // Enemy types: chaser, zig, scout
+  function spawnEnemy(typeOverride){
+    const p = state.player;
+    const edge = Math.floor(Math.random()*4);
+    const margin = 28;
+    const ratio = (window.devicePixelRatio || 1);
+    const W = canvas.width/ratio, H = canvas.height/ratio;
+    let x,y;
+    if(edge===0){ x = -margin; y = Math.random()*H; }
+    if(edge===1){ x = W+margin; y = Math.random()*H; }
+    if(edge===2){ x = Math.random()*W; y = -margin; }
+    if(edge===3){ x = Math.random()*W; y = H+margin; }
+    const sizes = {chaser:20, zig:16, scout:12};
+    const t = typeOverride || (Math.random()<0.55 ? 'chaser' : Math.random()<0.6 ? 'zig' : 'scout');
+    const size = sizes[t] || 18;
+    // base speed influenced by wave/time
+    const base = (t==='scout' ? 120 : t==='zig' ? 70 : 50);
+    const speed = base + Math.min(state.time*0.9, 200) + Math.random()*30;
+    const color = (t==='scout' ? '#f97316' : t==='zig' ? '#fb7185' : '#ef4444');
+    const enemy = {x,y,size,speed,color,vx:0,vy:0,type:t,angle:Math.random()*Math.PI*2, zigTimer:0};
+    state.enemies.push(enemy);
+  }
+
+  // Powerups: heal, shield, speed, multi
+  function spawnPower(){
+    const ratio = (window.devicePixelRatio || 1);
+    const pad = 36;
+    const W = canvas.width/ratio, H = canvas.height/ratio;
+    const x = pad + Math.random()*(W-pad*2);
+    const y = pad + Math.random()*(H-pad*2);
+    const types = ['heal','shield','speed','multi'];
+    const r = Math.random();
+    const type = r < 0.45 ? 'heal' : r < 0.75 ? 'shield' : r < 0.9 ? 'speed' : 'multi';
+    const color = type === 'heal' ? '#34d399' : type==='shield' ? '#60a5fa' : type==='speed' ? '#fbbf24' : '#c084fc';
+    state.powerups.push({x,y,size:16,type,color,time:0,ttl:18});
+  }
+
+  // Particles for feedback
+  function emit(x,y,color,count=12,spread=Math.PI*2,speed=80,life=0.6){
+    for(let i=0;i<count;i++){
+      const ang = (Math.random()*spread) + (Math.random()>0.5?0:0);
+      const sp = speed*(0.4 + Math.random()*0.9);
+      state.particles.push({
+        x,y,vx:Math.cos(ang)*sp*(Math.random()*1.1), vy:Math.sin(ang)*sp*(Math.random()*1.1),
+        size:2+Math.random()*3, life:life*(0.6+Math.random()*0.9), age:0, color
+      });
+    }
+  }
+
+  // Collision: rect-rect (squares)
+  function rectColl(ax,ay,aw,ah,bx,by,bw,bh){
+    return !(ax+aw < bx || ax > bx+bw || ay+ah < by || ay > by+bh);
+  }
+
+  // Apply powerups
+  function applyPower(u){
+    const p = state.player;
+    if(u.type === 'heal'){ p.health = Math.min(6, p.health + 1); beep(660,0.06,'sine',0.06); emit(u.x,u.y,'#34d399',14,Math.PI*2,90,0.5); }
+    if(u.type === 'shield'){ p.shield = Math.max(p.shield, 6.5); p.invulnerable = Math.max(p.invulnerable, 0.1); beep(520,0.09,'sine',0.06); emit(u.x,u.y,'#60a5fa',16,Math.PI*2,100,0.7); }
+    if(u.type === 'speed'){ p.speedBoost = Math.max(p.speedBoost, 7.0); beep(880,0.06,'triangle',0.06); emit(u.x,u.y,'#fbbf24',12,Math.PI*2,120,0.6); }
+    if(u.type === 'multi'){ state.multiplier = Math.min(5, state.multiplier + 0.5); state.combo = Math.max(state.combo,1); beep(440,0.12,'sawtooth',0.08); emit(u.x,u.y,'#c084fc',20,Math.PI*2,140,0.8); }
+    // visual and feedback
+  }
+
+  // On enemy destroyed
+  function onDestroyEnemy(e){
+    // score influenced by multiplier
+    const delta = Math.round(1 * state.multiplier * (e.type==='scout'?1.5:e.type==='zig'?1.2:1));
+    state.score += delta;
+    state.combo += 1;
+    state.comboTimer = 2.8; // seconds to continue combo
+    // modest beep based on combo
+    beep(300 + Math.min(1200, state.combo*18 + state.multiplier*30), 0.05, state.combo>6?'sawtooth':'sine', 0.06);
+    // particles
+    emit(e.x, e.y, e.color, 14 + Math.floor(Math.random()*8), Math.PI*2, 140 + Math.random()*80, 0.6 + Math.random()*0.4);
+  }
+
+  // Game over
+  function gameOver(){
+    state.running = false;
+    // a deep tone
+    beep(120, 0.9, 'sine', 0.12);
+    render(true);
+  }
+
+  // Restart
+  function restart(){
+    state = newState();
+    // spawn a few initial enemies
+    for(let i=0;i<3;i++) spawnEnemy(i===0?'chaser':i===1?'zig':'scout');
+  }
+  restart();
+
+  // Main loop
+  let last = performance.now();
+  function loop(now){
+    const dt = Math.min(0.05, (now-last)/1000);
+    last = now;
+    if(state.running) update(dt);
+    render();
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+
+  // Update logic
+  function update(dt){
+    state.time += dt;
+
+    // spawn pacing & wave bursts
+    if(state.time - state.lastEnemySpawn > state.enemySpawnInterval){
+      // sometimes spawn a burst wave
+      if(state.time > state.nextBurstAt){
+        const burstCount = 3 + Math.floor(Math.random()*4) + Math.floor(state.wave*0.6);
+        for(let i=0;i<burstCount;i++) spawnEnemy(Math.random()<0.6?'chaser':'zig');
+        state.lastEnemySpawn = state.time;
+        state.nextBurstAt = state.time + 6 + Math.random()*8;
+        state.wave += 1;
+      } else {
+        // regular spawn with chance for varied enemy
+        spawnEnemy();
+        state.lastEnemySpawn = state.time;
+      }
+    }
+
+    if(state.time - state.lastPowerSpawn > state.powerSpawnInterval){
+      spawnPower();
+      state.lastPowerSpawn = state.time;
+    }
+
+    // player movement
+    const p = state.player;
+    let dx=0, dy=0;
+    if(keys['arrowup'] || keys['w']) dy -= 1;
+    if(keys['arrowdown'] || keys['s']) dy += 1;
+    if(keys['arrowleft'] || keys['a']) dx -= 1;
+    if(keys['arrowright'] || keys['d']) dx += 1;
+    const mag = Math.hypot(dx,dy) || 1;
+    const currentSpeed = p.baseSpeed * (p.speedBoost>0 ? 1.9 : 1);
+    p.x += (dx/mag) * currentSpeed * dt;
+    p.y += (dy/mag) * currentSpeed * dt;
+    // bounds
+    const ratio = (window.devicePixelRatio || 1);
+    const W = canvas.width/ratio, H = canvas.height/ratio;
+    p.x = clamp(p.x, p.size/2, W - p.size/2);
+    p.y = clamp(p.y, p.size/2, H - p.size/2);
+
+    // enemies behavior
+    for(const e of state.enemies){
+      if(e.type === 'chaser'){
+        const ang = Math.atan2(p.y - e.y, p.x - e.x);
+        e.vx += Math.cos(ang) * 0.035;
+        e.vy += Math.sin(ang) * 0.035;
+      } else if(e.type === 'zig'){
+        // zigzag: oscillate angle while moving toward player
+        e.zigTimer += dt;
+        const toward = Math.atan2(p.y - e.y, p.x - e.x);
+        const wiggle = Math.sin(e.zigTimer*8 + e.angle) * 0.9;
+        const ang = toward + wiggle*0.9;
+        e.vx += Math.cos(ang) * 0.03;
+        e.vy += Math.sin(ang) * 0.03;
+      } else if(e.type === 'scout'){
+        // fast direct with slight drift
+        const ang = Math.atan2(p.y - e.y, p.x - e.x);
+        e.vx += Math.cos(ang) * 0.06;
+        e.vy += Math.sin(ang) * 0.06;
+      }
+      // normalize & move
+      const vmag = Math.hypot(e.vx, e.vy) || 1;
+      e.x += (e.vx/vmag) * e.speed * dt;
+      e.y += (e.vy/vmag) * e.speed * dt;
+    }
+
+    // collisions: enemies <-> player
+    for(let i = state.enemies.length - 1; i >= 0; i--){
+      const e = state.enemies[i];
+      const size = e.size;
+      if(rectColl(state.player.x - state.player.size/2, state.player.y - state.player.size/2, state.player.size, state.player.size,
+                  e.x - size/2, e.y - size/2, size, size)){
+        // if player has shield/invul OR very short invul after hit
+        if(p.invulnerable > 0 || p.shield > 0){
+          // destroy enemy and give points
+          onDestroyEnemy(e);
+          state.enemies.splice(i,1);
+        } else {
+          // damage
+          state.enemies.splice(i,1);
+          p.health -= 1;
+          p.invulnerable = 0.9;
+          state.combo = 0;
+          state.multiplier = Math.max(1, state.multiplier - 0.8);
+          beep(220,0.14,'sine',0.12);
+          emit(e.x,e.y,'#222',18,Math.PI*2,120,0.9);
+          if(p.health <= 0){ gameOver(); return; }
+        }
+      }
+    }
+
+    // powerups pickup & lifetime
+    for(let i = state.powerups.length - 1; i >= 0; i--){
+      const u = state.powerups[i];
+      u.time += dt;
+      const s = u.size;
+      if(rectColl(p.x - p.size/2, p.y - p.size/2, p.size, p.size, u.x - s/2, u.y - s/2, s, s)){
+        applyPower(u);
+        state.powerups.splice(i,1);
+      } else if(u.time > u.ttl){
+        state.powerups.splice(i,1);
+      }
+    }
+
+    // particles update
+    for(let i = state.particles.length - 1; i >= 0; i--){
+      const q = state.particles[i];
+      q.age += dt;
+      if(q.age >= q.life){ state.particles.splice(i,1); continue; }
+      q.x += q.vx * dt;
+      q.y += q.vy * dt;
+      // slight drag
+      q.vx *= 0.98; q.vy *= 0.98;
+    }
+
+    // timers
+    if(p.invulnerable > 0) p.invulnerable = Math.max(0, p.invulnerable - dt);
+    if(p.speedBoost > 0) p.speedBoost = Math.max(0, p.speedBoost - dt);
+    if(p.shield > 0) p.shield = Math.max(0, p.shield - dt);
+
+    // combo decay
+    if(state.comboTimer > 0){ state.comboTimer -= dt; if(state.comboTimer <= 0){ state.combo = 0; state.multiplier = Math.max(1, state.multiplier - 0.5); } }
+    // slowly reduce multiplier over time if not maintained
+    if(state.time % 8 < dt) state.multiplier = Math.max(1, state.multiplier - 0.03);
+
+    // cap enemies
+    if(state.enemies.length > 40) state.enemies.splice(0, state.enemies.length - 40);
+
+    // difficulty scaling: faster spawns over time (soft)
+    if(state.time > 8) state.enemySpawnInterval = Math.max(0.36, 1.4 - state.time*0.018 - Math.min(0.7, state.wave*0.01));
+    if(state.time > 20) state.powerSpawnInterval = Math.max(3.6, 5 - state.time*0.01);
+
+    // UI values
+    scoreEl.textContent = `Time: ${state.time.toFixed(1)}s • Score: ${state.score}`;
+    healthEl.textContent = `Health: ${p.health}`;
+    powerEl.textContent = `${p.speedBoost>0? 'Speed' : p.shield>0? 'Shield' : p.invulnerable>0? 'Invul' : '—'}`;
+    multEl.textContent = `x${state.multiplier.toFixed(1)}`;
+  }
+
+  // Render
+  function render(overlay=false){
+    const ratio = (window.devicePixelRatio || 1);
+    const W = canvas.width/ratio, H = canvas.height/ratio;
+    ctx.clearRect(0,0,W,H);
+
+    // subtle background grid
+    ctx.save();
+    ctx.globalAlpha = 0.06;
+    ctx.strokeStyle = '#9fb6c9';
+    ctx.lineWidth = 1;
+    const gap = 36;
+    for(let x=0;x<W;x+=gap){ ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,H); ctx.stroke(); }
+    for(let y=0;y<H;y+=gap){ ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(W,y); ctx.stroke(); }
+    ctx.restore();
+
+    // powerups (floating animation)
+    for(const u of state.powerups){
+      ctx.save();
+      const wob = Math.sin((u.time + u.x + u.y)*2.5)*2;
+      const size = u.size + wob;
+      ctx.globalAlpha = 0.98;
+      drawCube(u.x - size/2, u.y - size/2, size, u.color, true);
+      // small icon
+      ctx.fillStyle = '#072028';
+      ctx.font = '10px system-ui, Arial';
+      ctx.textAlign = 'center';
+      ctx.fillText(u.type[0].toUpperCase(), u.x, u.y+4);
+      ctx.restore();
+    }
+
+    // enemies
+    for(const e of state.enemies){
+      drawCube(e.x - e.size/2, e.y - e.size/2, e.size, e.color, true);
+      // faint shadow
+      ctx.save(); ctx.globalAlpha = 0.12; ctx.fillStyle = '#000'; ctx.fillRect(e.x - e.size/2, e.y + e.size/2 + 3, e.size, 3); ctx.restore();
+    }
+
+    // player (outline pulsing if invul/shield)
+    const p = state.player;
+    if(p.invulnerable>0 || p.shield>0){
+      ctx.save();
+      const pulse = 0.5 + 0.45*Math.sin(state.time*12);
+      const col = p.shield>0? '#60a5fa' : '#fff4';
+      drawRectOutline(p.x - p.size/2 - 6, p.y - p.size/2 - 6, p.size + 12, p.size + 12, col, 3 + pulse*2);
+      ctx.restore();
+    }
+    drawCube(p.x - p.size/2, p.y - p.size/2, p.size, p.color, true);
+
+    // particles
+    for(const q of state.particles){
+      ctx.save();
+      const a = 1 - (q.age / q.life);
+      ctx.globalAlpha = a;
+      ctx.fillStyle = q.color;
+      ctx.beginPath();
+      ctx.arc(q.x, q.y, q.size * a, 0, Math.PI*2);
+      ctx.fill();
+      ctx.restore();
+    }
+
+    // HUD inside canvas (top-left)
+    ctx.save();
+    ctx.fillStyle = 'rgba(0,0,0,0.25)';
+    ctx.fillRect(8,8,260,60);
+    ctx.fillStyle = '#e6eef8';
+    ctx.font = '14px system-ui, Arial';
+    ctx.textAlign = 'left';
+    ctx.fillText(`Time: ${state.time.toFixed(1)}s`, 16, 28);
+    ctx.fillText(`Health: ${p.health}`, 16, 48);
+    ctx.fillStyle = '#9fb6c9';
+    ctx.fillText(`Score: ${state.score} • x${state.multiplier.toFixed(1)}`, 140, 28);
+    ctx.restore();
+
+    // combo indicator
+    if(state.combo > 1){
+      ctx.save();
+      ctx.globalAlpha = 0.95;
+      ctx.font = '18px system-ui, Arial';
+      ctx.fillStyle = '#ffd166';
+      ctx.textAlign = 'left';
+      ctx.fillText(`Combo: ${state.combo} • x${state.multiplier.toFixed(1)}`, 16, 78);
+      ctx.restore();
+    }
+
+    // game over overlay
+    if(!state.running || overlay){
+      ctx.save();
+      ctx.fillStyle = 'rgba(2,6,23,0.75)';
+      ctx.fillRect(0,0,W,H);
+      ctx.fillStyle = '#fff';
+      ctx.textAlign = 'center';
+      ctx.font = '36px system-ui, Arial';
+      ctx.fillText('GAME OVER', W/2, H/2 - 16);
+      ctx.font = '18px system-ui, Arial';
+      ctx.fillText(`You survived ${state.time.toFixed(1)}s • Score ${state.score}`, W/2, H/2 + 18);
+      ctx.font = '14px system-ui, Arial';
+      ctx.fillText(`Press Restart to play again`, W/2, H/2 + 46);
+      ctx.restore();
+    }
+  }
+
+  // drawing helpers
+  function drawCube(x,y,size,color,withInner=true){
+    // main face
+    ctx.fillStyle = color;
+    roundRect(ctx, x, y, size, size, 4, true, false);
+    // top highlight band
+    if(withInner){
+      ctx.fillStyle = 'rgba(255,255,255,0.09)';
+      ctx.fillRect(x, y, size, size*0.22);
+      // left shadow
+      ctx.fillStyle = 'rgba(0,0,0,0.08)';
+      ctx.fillRect(x, y, size*0.18, size);
+      // inner stroke
+      ctx.strokeStyle = 'rgba(0,0,0,0.22)'; ctx.lineWidth = 1; ctx.strokeRect(x+0.5,y+0.5,size-1,size-1);
+    }
+  }
+  function drawRectOutline(x,y,w,h,col,th=3){
+    ctx.strokeStyle = col; ctx.lineWidth = th; ctx.strokeRect(x+1.5,y+1.5,w-3,h-3);
+  }
+  function roundRect(ctx, x, y, width, height, radius, fill, stroke) {
+    if (typeof stroke === 'undefined') stroke = true;
+    if (typeof radius === 'undefined') radius = 5;
+    if (typeof radius === 'number') radius = {tl: radius, tr: radius, br: radius, bl: radius};
+    ctx.beginPath();
+    ctx.moveTo(x + radius.tl, y);
+    ctx.lineTo(x + width - radius.tr, y);
+    ctx.quadraticCurveTo(x + width, y, x + width, y + radius.tr);
+    ctx.lineTo(x + width, y + height - radius.br);
+    ctx.quadraticCurveTo(x + width, y + height, x + width - radius.br, y + height);
+    ctx.lineTo(x + radius.bl, y + height);
+    ctx.quadraticCurveTo(x, y + height, x, y + height - radius.bl);
+    ctx.lineTo(x, y + radius.tl);
+    ctx.quadraticCurveTo(x, y, x + radius.tl, y);
+    ctx.closePath();
+    if (fill) ctx.fill();
+    if (stroke) ctx.stroke();
+  }
+
+  // Start/Restart button
+  restartBtn.addEventListener('click', ()=>{
+    restart();
+    // resume audio context on user gesture (for browsers that require it)
+    if(audio && audio.state === 'suspended') audio.resume();
+    last = performance.now();
+  });
+
+  // Initialize a gentle intro spawn
+  for(let i=0;i<3;i++) spawnEnemy(i===0?'chaser':i===1?'zig':'scout');
+
+})();
+</script>
+</body>
+</html>
